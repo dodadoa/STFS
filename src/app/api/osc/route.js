@@ -75,17 +75,44 @@ export async function POST(request) {
   console.log(`[OSC] POST request received at ${new Date().toISOString()}`);
   
   try {
-    const body = await request.json();
-    const { address, args } = body;
+    // Check if request has a body
+    const contentType = request.headers.get('content-type');
+    console.log(`[OSC] Content-Type: ${contentType}`);
     
-    console.log(`[OSC] Message: address="${address || '/stfs'}", args=`, args || []);
+    let body = {};
+    let address = '/stfs';
+    let args = [];
+    
+    // Only try to parse JSON if content-type indicates JSON
+    if (contentType && contentType.includes('application/json')) {
+      try {
+        const text = await request.text();
+        console.log(`[OSC] Request body text: "${text}"`);
+        
+        if (text && text.trim().length > 0) {
+          body = JSON.parse(text);
+          address = body.address || '/stfs';
+          args = body.args || [];
+        } else {
+          console.log(`[OSC] Empty body, using defaults`);
+        }
+      } catch (parseError) {
+        console.error(`[OSC] JSON parse error:`, parseError.message);
+        return NextResponse.json({ 
+          error: 'Invalid JSON in request body',
+          details: parseError.message
+        }, { status: 400 });
+      }
+    } else {
+      console.log(`[OSC] No JSON content-type, using defaults`);
+    }
+    
+    console.log(`[OSC] Message: address="${address}", args=`, args);
     
     const socket = initSocket();
-    const messageAddress = address || '/stfs';
-    const messageArgs = args || [];
     
     // Encode OSC message
-    const oscMessage = encodeOSC(messageAddress, messageArgs);
+    const oscMessage = encodeOSC(address, args);
     console.log(`[OSC] Encoded message length: ${oscMessage.length} bytes`);
     
     // Send via UDP
@@ -102,8 +129,8 @@ export async function POST(request) {
     
     return NextResponse.json({ 
       success: true,
-      address: messageAddress,
-      args: messageArgs,
+      address: address,
+      args: args,
       sentTo: `${OSC_HOST}:${OSC_PORT}`
     });
   } catch (error) {
