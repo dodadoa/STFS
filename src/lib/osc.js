@@ -63,7 +63,7 @@ export function sendCollisionEvent(intensity, throttleMs = 50) {
  * @param {number} arenaRadius - Arena radius
  * @param {number} throttleMs - Minimum time between sends (default: 100ms = 10Hz)
  */
-export function sendTopsData(tops, arenaRadius, throttleMs = 100) {
+export async function sendTopsData(tops, arenaRadius, throttleMs = 100) {
   const now = Date.now();
   if (now - lastOscSendTime > throttleMs && tops.length > 0) {
     lastOscSendTime = now;
@@ -71,8 +71,9 @@ export function sendTopsData(tops, arenaRadius, throttleMs = 100) {
     const centerX = arenaRadius + 50;
     const centerY = arenaRadius + 50;
     
-    // Send individual top data
-    tops.forEach((top, index) => {
+    // Send individual top data sequentially to avoid overwhelming the server
+    for (let index = 0; index < tops.length; index++) {
+      const top = tops[index];
       const distanceFromCenter = Math.sqrt(
         (top.x - centerX) ** 2 + (top.y - centerY) ** 2
       );
@@ -82,7 +83,8 @@ export function sendTopsData(tops, arenaRadius, throttleMs = 100) {
       const speed = Math.sqrt(top.vx ** 2 + top.vy ** 2);
       const normalizedSpeed = Math.min(speed / 10, 1.0); // Normalize speed
       
-      sendOSC(`/stfs/top/${index}`, [
+      // Wait for each request to complete before sending the next
+      await sendOSC(`/stfs/top/${index}`, [
         normalizedX,           // X position (-1 to 1)
         normalizedY,           // Y position (-1 to 1)
         normalizedDistance,    // Distance from center (0 to 1)
@@ -90,7 +92,7 @@ export function sendTopsData(tops, arenaRadius, throttleMs = 100) {
         top.angularVelocity,   // Angular velocity
         top.collisionFlash     // Collision flash intensity
       ]);
-    });
+    }
   }
 }
 
