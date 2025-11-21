@@ -1,4 +1,4 @@
-# Spinning Top Battle Arena
+# Spinning Top For Sound
 
 An interactive physics simulation of spinning tops in a circular arena. Watch tops spiral toward the center, collide with realistic physics. Includes **OSC (Open Sound Control)** support for integration with SuperCollider, PureData, and PuckData.
 
