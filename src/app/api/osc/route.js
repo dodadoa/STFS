@@ -1,73 +1,66 @@
 import { NextResponse } from 'next/server';
-import dgram from 'dgram';
 
 // OSC configuration
 const OSC_HOST = process.env.OSC_HOST || '127.0.0.1';
 const OSC_PORT = parseInt(process.env.OSC_PORT || '57120'); // PureData default
 
-// Simple UDP socket for sending OSC messages
-let udpSocket = null;
+let oscClient = null;
+let OSC = null; // Store the OSC class for creating messages
+let oscInitialized = false;
+let oscInitError = null;
+let initPromise = null;
 
-function initSocket() {
-  if (udpSocket) return udpSocket;
+// Initialize OSC client
+async function initOSC() {
+  if (oscInitialized) return;
+  if (typeof window !== 'undefined') return;
   
-  console.log(`[OSC] Initializing UDP socket to ${OSC_HOST}:${OSC_PORT}`);
-  udpSocket = dgram.createSocket('udp4');
-  
-  udpSocket.on('error', (err) => {
-    console.error('[OSC] Socket error:', err);
-  });
-  
-  console.log('[OSC] Socket created successfully');
-  return udpSocket;
-}
-
-// Simple OSC message encoder (minimal implementation)
-function encodeOSC(address, args) {
-  const parts = [];
-  
-  // Encode address (null-terminated, padded to 4 bytes)
-  const addressBytes = Buffer.from(address + '\0', 'utf8');
-  const addressPadded = Buffer.alloc(Math.ceil((addressBytes.length) / 4) * 4);
-  addressBytes.copy(addressPadded);
-  parts.push(addressPadded);
-  
-  // Type tag string (starts with comma, then types, null-terminated, padded to 4 bytes)
-  let typeTag = ',';
-  const argBuffers = [];
-  
-  for (const arg of args) {
-    if (typeof arg === 'number') {
-      if (Number.isInteger(arg)) {
-        typeTag += 'i'; // integer
-        const buf = Buffer.alloc(4);
-        buf.writeInt32BE(arg, 0);
-        argBuffers.push(buf);
-      } else {
-        typeTag += 'f'; // float
-        const buf = Buffer.alloc(4);
-        buf.writeFloatBE(arg, 0);
-        argBuffers.push(buf);
-      }
-    } else if (typeof arg === 'string') {
-      typeTag += 's';
-      const strBytes = Buffer.from(arg + '\0', 'utf8');
-      const strPadded = Buffer.alloc(Math.ceil((strBytes.length) / 4) * 4);
-      strBytes.copy(strPadded);
-      argBuffers.push(strPadded);
-    }
+  if (initPromise) {
+    return initPromise;
   }
   
-  // Encode type tag
-  const typeTagBytes = Buffer.from(typeTag + '\0', 'utf8');
-  const typeTagPadded = Buffer.alloc(Math.ceil((typeTagBytes.length) / 4) * 4);
-  typeTagBytes.copy(typeTagPadded);
-  parts.push(typeTagPadded);
+  initPromise = (async () => {
+    try {
+      console.log(`[OSC] Loading osc-js module...`);
+      const oscModule = await import('osc-js');
+      OSC = oscModule.default || oscModule;
+      
+      console.log(`[OSC] Creating OSC client with DatagramPlugin`);
+      console.log(`[OSC] Target: ${OSC_HOST}:${OSC_PORT}`);
+      
+      oscClient = new OSC({ plugin: new OSC.DatagramPlugin() });
+      
+      // Set up event listeners for debugging
+      oscClient.on('open', () => {
+        console.log(`[OSC] Socket opened successfully`);
+      });
+      
+      oscClient.on('error', (error) => {
+        console.error(`[OSC] Client error:`, error);
+      });
+      
+      console.log(`[OSC] Opening connection...`);
+      oscClient.open({ 
+        host: OSC_HOST, 
+        port: OSC_PORT,
+        metadata: true 
+      });
+      
+      oscInitialized = true;
+      console.log(`[OSC] Initialization complete`);
+    } catch (error) {
+      console.error('[OSC] Initialization error:', error);
+      console.error('[OSC] Error stack:', error.stack);
+      oscInitError = error.message;
+      oscClient = null;
+      OSC = null;
+      oscInitialized = true;
+    } finally {
+      initPromise = null;
+    }
+  })();
   
-  // Add argument buffers
-  parts.push(...argBuffers);
-  
-  return Buffer.concat(parts);
+  return initPromise;
 }
 
 export async function POST(request) {
@@ -109,20 +102,31 @@ export async function POST(request) {
     
     console.log(`[OSC] Message: address="${address}", args=`, args);
     
-    const socket = initSocket();
+    // Initialize OSC client
+    await initOSC();
     
-    // Encode OSC message
-    const oscMessage = encodeOSC(address, args);
-    console.log(`[OSC] Encoded message length: ${oscMessage.length} bytes`);
+    if (!oscClient) {
+      console.error(`[OSC] Client not available`);
+      return NextResponse.json({ 
+        error: 'OSC not initialized', 
+        details: oscInitError || 'OSC client failed to initialize'
+      }, { status: 503 });
+    }
     
-    // Send via UDP
-    socket.send(oscMessage, OSC_PORT, OSC_HOST, (err) => {
-      if (err) {
-        console.error(`[OSC] Send error:`, err);
-      } else {
-        console.log(`[OSC] Message sent successfully to ${OSC_HOST}:${OSC_PORT}`);
-      }
-    });
+    // Send OSC message using osc-js
+    console.log(`[OSC] Creating OSC.Message with address="${address}" and args=`, args);
+    try {
+      // Create OSC.Message object - pass address as first arg, then all args
+      const message = new OSC.Message(address, ...args);
+      console.log(`[OSC] Message created, sending...`);
+      
+      oscClient.send(message);
+      console.log(`[OSC] Message sent successfully to ${OSC_HOST}:${OSC_PORT}`);
+    } catch (sendError) {
+      console.error(`[OSC] Send error:`, sendError);
+      console.error(`[OSC] Send error stack:`, sendError.stack);
+      throw sendError;
+    }
     
     const duration = Date.now() - startTime;
     console.log(`[OSC] Request processed in ${duration}ms`);
@@ -145,11 +149,24 @@ export async function POST(request) {
 
 export async function GET() {
   console.log(`[OSC] GET request received`);
-  return NextResponse.json({
-    oscEnabled: true,
-    host: OSC_HOST,
-    port: OSC_PORT,
-    socketCreated: udpSocket !== null
-  });
+  try {
+    await initOSC();
+    
+    return NextResponse.json({
+      oscEnabled: oscClient !== null,
+      host: OSC_HOST,
+      port: OSC_PORT,
+      initialized: oscInitialized,
+      error: oscInitError || null
+    });
+  } catch (error) {
+    console.error('[OSC] GET error:', error);
+    return NextResponse.json({
+      oscEnabled: false,
+      host: OSC_HOST,
+      port: OSC_PORT,
+      error: error.message
+    }, { status: 500 });
+  }
 }
 
