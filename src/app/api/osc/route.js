@@ -1,18 +1,76 @@
 import { NextResponse } from 'next/server';
+import { execSync } from 'child_process';
+import fs from 'fs';
+
+// Function to get Windows host IP from WSL2
+function getWindowsHostIP() {
+  try {
+    // In WSL2, the Windows host IP is typically the first IP in the route to the default gateway
+    // We can get it from the default route
+    const result = execSync('ip route show | grep default', { encoding: 'utf8' });
+    const match = result.match(/default via (\d+\.\d+\.\d+\.\d+)/);
+    if (match && match[1]) {
+      return match[1];
+    }
+  } catch (error) {
+    console.warn('[OSC] Could not detect Windows host IP from route:', error.message);
+  }
+  
+  // Fallback: try to get from /etc/resolv.conf (WSL2 stores host IP there)
+  try {
+    const resolv = fs.readFileSync('/etc/resolv.conf', 'utf8');
+    const match = resolv.match(/nameserver\s+(\d+\.\d+\.\d+\.\d+)/);
+    if (match && match[1]) {
+      return match[1];
+    }
+  } catch (error) {
+    console.warn('[OSC] Could not read /etc/resolv.conf:', error.message);
+  }
+  
+  return null;
+}
+
+// Detect if we're in WSL2
+function isWSL2() {
+  try {
+    const release = fs.readFileSync('/proc/version', 'utf8');
+    return release.includes('microsoft') || release.includes('WSL');
+  } catch {
+    return false;
+  }
+}
 
 // OSC configuration
-const OSC_HOST = process.env.OSC_HOST || '127.0.0.1';
+// In WSL2, use Windows host IP; otherwise use localhost
+let defaultHost = '127.0.0.1';
+if (typeof window === 'undefined') {
+  if (isWSL2()) {
+    const hostIP = getWindowsHostIP();
+    if (hostIP) {
+      defaultHost = hostIP;
+      console.log(`[OSC] Detected WSL2 environment, using Windows host IP: ${hostIP}`);
+    } else {
+      console.warn(`[OSC] WSL2 detected but could not find Windows host IP, using 127.0.0.1`);
+      console.warn(`[OSC] You may need to set OSC_HOST environment variable to your Windows IP`);
+    }
+  }
+}
+
+const OSC_HOST = process.env.OSC_HOST || defaultHost;
 const OSC_PORT = parseInt(process.env.OSC_PORT || '57120'); // PureData default
+
+console.log(`[OSC] Configuration: HOST=${OSC_HOST}, PORT=${OSC_PORT}`);
 
 let oscClient = null;
 let OSC = null; // Store the OSC class for creating messages
 let oscInitialized = false;
 let oscInitError = null;
 let initPromise = null;
+let socketReady = false; // Track if socket is actually open
 
 // Initialize OSC client
 async function initOSC() {
-  if (oscInitialized) return;
+  if (oscInitialized && socketReady) return;
   if (typeof window !== 'undefined') return;
   
   if (initPromise) {
@@ -28,22 +86,38 @@ async function initOSC() {
       console.log(`[OSC] Creating OSC client with DatagramPlugin`);
       console.log(`[OSC] Target: ${OSC_HOST}:${OSC_PORT}`);
       
-      oscClient = new OSC({ plugin: new OSC.DatagramPlugin() });
-      
-      // Set up event listeners for debugging
-      oscClient.on('open', () => {
-        console.log(`[OSC] Socket opened successfully`);
+      // Create plugin with remote address configuration
+      const plugin = new OSC.DatagramPlugin({
+        send: {
+          host: OSC_HOST,
+          port: OSC_PORT
+        }
       });
       
-      oscClient.on('error', (error) => {
-        console.error(`[OSC] Client error:`, error);
-      });
+      oscClient = new OSC({ plugin: plugin });
       
-      console.log(`[OSC] Opening connection...`);
-      oscClient.open({ 
-        host: OSC_HOST, 
-        port: OSC_PORT,
-        metadata: true 
+      // Wait for socket to open before marking as ready
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Socket open timeout'));
+        }, 5000);
+        
+        oscClient.on('open', () => {
+          clearTimeout(timeout);
+          socketReady = true;
+          console.log(`[OSC] Socket opened successfully, ready to send to ${OSC_HOST}:${OSC_PORT}`);
+          resolve();
+        });
+        
+        oscClient.on('error', (error) => {
+          clearTimeout(timeout);
+          console.error(`[OSC] Client error:`, error);
+          reject(error);
+        });
+        
+        console.log(`[OSC] Opening connection...`);
+        // Open without specifying host/port - plugin handles remote address
+        oscClient.open();
       });
       
       oscInitialized = true;
@@ -54,7 +128,8 @@ async function initOSC() {
       oscInitError = error.message;
       oscClient = null;
       OSC = null;
-      oscInitialized = true;
+      socketReady = false;
+      oscInitialized = true; // Mark as initialized so we don't keep retrying
     } finally {
       initPromise = null;
     }
@@ -105,11 +180,11 @@ export async function POST(request) {
     // Initialize OSC client
     await initOSC();
     
-    if (!oscClient) {
-      console.error(`[OSC] Client not available`);
+    if (!oscClient || !socketReady) {
+      console.error(`[OSC] Client not available or socket not ready`);
       return NextResponse.json({ 
         error: 'OSC not initialized', 
-        details: oscInitError || 'OSC client failed to initialize'
+        details: oscInitError || 'OSC client failed to initialize or socket not ready'
       }, { status: 503 });
     }
     
@@ -118,8 +193,10 @@ export async function POST(request) {
     try {
       // Create OSC.Message object - pass address as first arg, then all args
       const message = new OSC.Message(address, ...args);
-      console.log(`[OSC] Message created, sending...`);
+      console.log(`[OSC] Message created, sending to ${OSC_HOST}:${OSC_PORT}...`);
+      console.log(`[OSC] Socket ready: ${socketReady}, Client state:`, oscClient.state || 'unknown');
       
+      // Send message - remote address is configured in the plugin
       oscClient.send(message);
       console.log(`[OSC] Message sent successfully to ${OSC_HOST}:${OSC_PORT}`);
     } catch (sendError) {
@@ -157,7 +234,9 @@ export async function GET() {
       host: OSC_HOST,
       port: OSC_PORT,
       initialized: oscInitialized,
-      error: oscInitError || null
+      socketReady: socketReady,
+      error: oscInitError || null,
+      firewallTest: `To test firewall, run: node test-udp.js ${OSC_HOST} ${OSC_PORT}`
     });
   } catch (error) {
     console.error('[OSC] GET error:', error);
